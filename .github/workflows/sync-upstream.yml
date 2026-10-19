@@ -1,0 +1,164 @@
+name: Sync upstream
+
+# 原文（quii/learn-go-with-tests）の更新を週1回確認し、
+# 更新があれば Claude Code でマージと翻訳を行って PR を作成する。
+#
+# 必要な設定:
+#   - Secrets: ANTHROPIC_API_KEY または CLAUDE_CODE_OAUTH_TOKEN
+#   - Variables（任意）: SYNC_AUTO_MERGE=true にすると、検証に通った PR を自動でマージする（既定は PR 作成まで）
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # 毎週月曜 09:00 JST
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: upstream-sync
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/quii/learn-go-with-tests.git
+          git fetch upstream main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          count=$(git rev-list --count HEAD..upstream/main)
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --label "$LABEL" --state open --json number --jq length)
+          echo "新しい upstream のコミット: $count 件 / 未マージの追従 PR: $open 件"
+          if [ "$count" -eq 0 ] || [ "$open" -gt 0 ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "needed=true"
+            echo "base=$(git merge-base HEAD upstream/main)"
+            echo "upstream_sha=$(git rev-parse upstream/main)"
+            echo "branch=sync-upstream-$(date +%Y%m%d)"
+          } >> "$GITHUB_OUTPUT"
+          git log --oneline HEAD..upstream/main
+
+      - name: Prepare branch
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "${{ steps.check.outputs.branch }}"
+
+      - name: Set up Go
+        if: steps.check.outputs.needed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: 1.25
+
+      - name: Merge upstream and translate
+        if: steps.check.outputs.needed == 'true'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 300
+            --allowedTools "Bash,Read,Edit,Write,Glob,Grep"
+          prompt: |
+            このリポジトリは quii/learn-go-with-tests の日本語訳フォークです。
+            upstream/main（${{ steps.check.outputs.upstream_sha }}）の更新をこのブランチに取り込み、訳文を追従させてください。
+            CLAUDE.md の「原文への追従手順」と「翻訳スタイル」に厳密に従ってください。
+
+            - 前回のマージベース: ${{ steps.check.outputs.base }}
+            - 作業ブランチ: ${{ steps.check.outputs.branch }}（チェックアウト済み。remote `upstream` は fetch 済み）
+
+            手順:
+            1. `git merge upstream/main --no-edit` を実行し、コンフリクトがあれば解消してマージコミットを作る。
+               - Go のコード・go.mod・go.sum・アセットは upstream 側を採用する。
+               - CLAUDE.md・README.md・SUMMARY.md など日本語版固有のファイルはこちら側を維持し、必要な変更（新章の目次追加など）だけを反映する。
+               - ルート直下に復活した英語版の章 .md は削除する（原文は `git show upstream/main:<file>` で参照できる）。
+            2. 既存章: `git diff ${{ steps.check.outputs.base }} upstream/main -- <章>.md` で英語の差分を確認し、対応する日本語版に変わった箇所だけを反映する。変わっていない段落の既存訳は書き換えない。
+            3. 新しい章: 全文を翻訳して配置表に従って置き、SUMMARY.md・README.md の目次・build.books.sh・build.sh・CLAUDE.md の配置表を更新する。
+            4. `scripts/verify-translation.sh` を実行し、合格するまで修正する。
+            5. 変更をコミットする。コミットメッセージは日本語で書き、Co-Authored-By や Generated with Claude Code の行は入れない。push はしない。
+            6. PR 本文用の要約を日本語で /tmp/sync-summary.md に書く（取り込んだ upstream の変更の概要、反映した章、新しく訳した章、判断に迷った点）。
+            7. 訳の正しさに自信が持てない箇所や、方針の判断が必要な点があり、人のレビューなしにマージすべきでないと判断した場合は、理由を /tmp/sync-needs-review に書く。
+
+      - name: Check result
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git merge-base --is-ancestor upstream/main HEAD || { echo "upstream/main がマージされていません"; exit 1; }
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "upstream 追従: 未コミットの変更を反映"
+          fi
+
+      - name: Verify
+        id: verify
+        if: steps.check.outputs.needed == 'true'
+        continue-on-error: true
+        run: |
+          ./scripts/verify-translation.sh
+          ./build.sh
+          ./build.books.sh
+          # ビルドで生じた差分・生成物は PR に含めない
+          git reset --hard HEAD
+          git clean -fd
+
+      - name: Create pull request
+        id: pr
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          git push -u origin "${{ steps.check.outputs.branch }}"
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color 0e8a16 --description "upstream への自動追従" --force
+          {
+            echo "upstream（quii/learn-go-with-tests）の ${{ steps.check.outputs.upstream_sha }} までを取り込み、訳文を追従させました。"
+            echo
+            if [ -s /tmp/sync-summary.md ]; then cat /tmp/sync-summary.md; else echo "（要約は出力されませんでした）"; fi
+            echo
+            echo "## 検証"
+            echo "- scripts/verify-translation.sh・build.sh・build.books.sh: ${{ steps.verify.outcome }}"
+            if [ -s /tmp/sync-needs-review ]; then
+              echo
+              echo "## 要レビュー"
+              cat /tmp/sync-needs-review
+            fi
+          } > /tmp/pr-body.md
+          url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "${{ steps.check.outputs.branch }}" \
+            --title "upstream の更新を取り込み、訳文を追従（$(date +%Y-%m-%d)）" \
+            --label "$LABEL" --body-file /tmp/pr-body.md)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Merge pull request
+        if: >-
+          steps.check.outputs.needed == 'true'
+          && steps.verify.outcome == 'success'
+          && vars.SYNC_AUTO_MERGE == 'true'
+        run: |
+          if [ -s /tmp/sync-needs-review ]; then
+            echo "要レビューのため自動マージしません"
+            exit 0
+          fi
+          # upstream の履歴を残すため、squash ではなくマージコミットでマージする
+          gh pr merge "${{ steps.pr.outputs.url }}" --merge --delete-branch
+
+      - name: Report skipped merge
+        if: steps.check.outputs.needed == 'true' && steps.verify.outcome != 'success'
+        run: |
+          gh pr comment "${{ steps.pr.outputs.url }}" --body "検証に失敗しました。マージ前にワークフローのログを確認してください: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
