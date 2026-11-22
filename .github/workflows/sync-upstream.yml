@@ -1,11 +1,13 @@
 name: Sync upstream
 
 # 原文（quii/learn-go-with-tests）の更新を週1回確認し、
-# 更新があれば Claude Code でマージと翻訳を行って PR を作成する。
+# 更新があれば upstream をマージしたうえで Codex（OpenAI）に訳文を追従させ、PR を作成する。
 #
 # 必要な設定:
-#   - Secrets: ANTHROPIC_API_KEY または CLAUDE_CODE_OAUTH_TOKEN
-#   - Variables（任意）: SYNC_AUTO_MERGE=true にすると、検証に通った PR を自動でマージする（既定は PR 作成まで）
+#   - Secrets: OPENAI_API_KEY
+#   - Variables（任意）:
+#       CODEX_MODEL=<モデル名>   使うモデル（未設定なら Codex の既定）
+#       SYNC_AUTO_MERGE=true     検証に通った PR を自動でマージする（既定は PR 作成まで）
 
 on:
   schedule:
@@ -19,7 +21,6 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
-  id-token: write
 
 jobs:
   sync:
@@ -28,6 +29,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       LABEL: upstream-sync
+      # Codex の作業メモ置き場（コミットには含めない）
+      WORK: .sync-work
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,12 +59,50 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           git log --oneline HEAD..upstream/main
 
-      - name: Prepare branch
+      - name: Merge upstream (without committing)
         if: steps.check.outputs.needed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "${{ steps.check.outputs.branch }}"
+          base="${{ steps.check.outputs.base }}"
+          mkdir -p "$WORK"
+
+          git merge upstream/main --no-commit --no-ff || true
+
+          # コンフリクトを機械的に解消する
+          #   - ルート直下の英語版の章（こちらで削除済み）→ 削除のまま
+          #   - 日本語版固有の Markdown → こちら側を維持（必要な変更は Codex が反映）
+          #   - それ以外（Go のコード・go.mod・go.sum・アセットなど）→ upstream 側を採用
+          : > "$WORK/kept-ours.txt"
+          git diff --name-only --diff-filter=U | while read -r f; do
+            st=$(git status --porcelain -- "$f" | cut -c1-2)
+            case "$f" in
+              */*.md|*.md)
+                if [ "$st" = "DU" ] || [ "$st" = "UD" ]; then
+                  git rm -q -- "$f"
+                else
+                  git checkout --ours -- "$f" && git add -- "$f"
+                  echo "$f" >> "$WORK/kept-ours.txt"
+                fi
+                ;;
+              *)
+                if [ "$st" = "UD" ]; then
+                  git rm -q -- "$f"
+                else
+                  git checkout --theirs -- "$f" && git add -- "$f"
+                fi
+                ;;
+            esac
+          done
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "解消できないコンフリクトが残っています"; git status; exit 1
+          fi
+
+          # Codex に渡す一覧
+          git diff --name-status "$base" upstream/main -- '*.md' > "$WORK/upstream-md-changes.txt"
+          echo "upstream で変更された Markdown:"; cat "$WORK/upstream-md-changes.txt"
 
       - name: Set up Go
         if: steps.check.outputs.needed == 'true'
@@ -69,45 +110,49 @@ jobs:
         with:
           go-version: 1.25
 
-      - name: Merge upstream and translate
-        if: steps.check.outputs.needed == 'true'
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
-          claude_args: |
-            --model claude-opus-5-5
-            --max-turns 300
-            --allowedTools "Bash,Read,Edit,Write,Glob,Grep"
-          prompt: |
-            このリポジトリは quii/learn-go-with-tests の日本語訳フォークです。
-            upstream/main（${{ steps.check.outputs.upstream_sha }}）の更新をこのブランチに取り込み、訳文を追従させてください。
-            CLAUDE.md の「原文への追従手順」と「翻訳スタイル」に厳密に従ってください。
-
-            - 前回のマージベース: ${{ steps.check.outputs.base }}
-            - 作業ブランチ: ${{ steps.check.outputs.branch }}（チェックアウト済み。remote `upstream` は fetch 済み）
-
-            手順:
-            1. `git merge upstream/main --no-edit` を実行し、コンフリクトがあれば解消してマージコミットを作る。
-               - Go のコード・go.mod・go.sum・アセットは upstream 側を採用する。
-               - CLAUDE.md・README.md・SUMMARY.md など日本語版固有のファイルはこちら側を維持し、必要な変更（新章の目次追加など）だけを反映する。
-               - ルート直下に復活した英語版の章 .md は削除する（原文は `git show upstream/main:<file>` で参照できる）。
-            2. 既存章: `git diff ${{ steps.check.outputs.base }} upstream/main -- <章>.md` で英語の差分を確認し、対応する日本語版に変わった箇所だけを反映する。変わっていない段落の既存訳は書き換えない。
-            3. 新しい章: 全文を翻訳して配置表に従って置き、SUMMARY.md・README.md の目次・build.books.sh・build.sh・CLAUDE.md の配置表を更新する。
-            4. `scripts/verify-translation.sh` を実行し、合格するまで修正する。
-            5. 変更をコミットする。コミットメッセージは日本語で書き、Co-Authored-By や Generated with Claude Code の行は入れない。push はしない。
-            6. PR 本文用の要約を日本語で /tmp/sync-summary.md に書く（取り込んだ upstream の変更の概要、反映した章、新しく訳した章、判断に迷った点）。
-            7. 訳の正しさに自信が持てない箇所や、方針の判断が必要な点があり、人のレビューなしにマージすべきでないと判断した場合は、理由を /tmp/sync-needs-review に書く。
-
-      - name: Check result
+      - name: Write prompt
         if: steps.check.outputs.needed == 'true'
         run: |
+          cat > "$WORK/prompt.md" <<EOF
+          このリポジトリは quii/learn-go-with-tests の日本語訳フォークです。
+          upstream/main（${{ steps.check.outputs.upstream_sha }}）はすでにマージ済み（未コミット）です。
+          英語原文の変更を日本語版に反映してください。CLAUDE.md の「原文への追従手順」と「翻訳スタイル」に厳密に従ってください。
+
+          - 前回のマージベース: ${{ steps.check.outputs.base }}
+          - upstream で変更された Markdown の一覧: $WORK/upstream-md-changes.txt（git diff --name-status の形式）
+          - コンフリクトのためこちら側を維持したファイル: $WORK/kept-ours.txt
+
+          手順:
+          1. 一覧の章ごとに \`git diff ${{ steps.check.outputs.base }} upstream/main -- <章>.md\` で英語の差分を確認し、
+             CLAUDE.md の配置表にある対応する日本語版に、変わった箇所だけを反映する。変わっていない段落の既存訳は書き換えない。
+             原文の全文は \`git show upstream/main:<章>.md\` で参照できる。
+          2. 新しい章（一覧で A のもの）は全文を翻訳して配置表に従って置き、ルート直下の英語版は削除する。
+             あわせて SUMMARY.md・README.md の目次・build.books.sh・build.sh・CLAUDE.md の配置表を更新する。
+          3. ルート直下に英語版の章が残っていたら削除する（README.md・SUMMARY.md・CLAUDE.md・gb-readme.md・LICENSE.md・pdf-cover.md は残す）。
+          4. kept-ours.txt のファイルは、upstream 側の変更のうち日本語版にも必要なものだけを反映する。
+          5. \`scripts/verify-translation.sh\` を実行し、合格するまで修正する。
+          6. Go のコード・go.mod・go.sum・アセットには手を加えない。
+          7. git add / git commit / git push は実行しない（コミットはワークフローが行う）。
+          8. PR 本文用の要約を日本語で $WORK/summary.md に書く（取り込んだ upstream の変更の概要、反映した章、新しく訳した章、判断に迷った点）。
+          9. 訳の正しさに自信が持てない箇所や、方針の判断が必要な点があり、人のレビューなしにマージすべきでないと判断した場合は、理由を $WORK/needs-review.md に書く。
+          EOF
+
+      - name: Translate with Codex
+        if: steps.check.outputs.needed == 'true'
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ${{ env.WORK }}/prompt.md
+          model: ${{ vars.CODEX_MODEL }}
+          sandbox: workspace-write
+
+      - name: Commit merge
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          mv "$WORK" /tmp/sync-work
+          git add -A
+          git commit --no-edit
           git merge-base --is-ancestor upstream/main HEAD || { echo "upstream/main がマージされていません"; exit 1; }
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "upstream 追従: 未コミットの変更を反映"
-          fi
 
       - name: Verify
         id: verify
@@ -130,14 +175,14 @@ jobs:
           {
             echo "upstream（quii/learn-go-with-tests）の ${{ steps.check.outputs.upstream_sha }} までを取り込み、訳文を追従させました。"
             echo
-            if [ -s /tmp/sync-summary.md ]; then cat /tmp/sync-summary.md; else echo "（要約は出力されませんでした）"; fi
+            if [ -s /tmp/sync-work/summary.md ]; then cat /tmp/sync-work/summary.md; else echo "（要約は出力されませんでした）"; fi
             echo
             echo "## 検証"
             echo "- scripts/verify-translation.sh・build.sh・build.books.sh: ${{ steps.verify.outcome }}"
-            if [ -s /tmp/sync-needs-review ]; then
+            if [ -s /tmp/sync-work/needs-review.md ]; then
               echo
               echo "## 要レビュー"
-              cat /tmp/sync-needs-review
+              cat /tmp/sync-work/needs-review.md
             fi
           } > /tmp/pr-body.md
           url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "${{ steps.check.outputs.branch }}" \
@@ -151,7 +196,7 @@ jobs:
           && steps.verify.outcome == 'success'
           && vars.SYNC_AUTO_MERGE == 'true'
         run: |
-          if [ -s /tmp/sync-needs-review ]; then
+          if [ -s /tmp/sync-work/needs-review.md ]; then
             echo "要レビューのため自動マージしません"
             exit 0
           fi
